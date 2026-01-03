@@ -1,0 +1,7 @@
+python-dotenv
+pybithumb
+requests
+pyJwt
+dotenv
+pathlib
+logging
