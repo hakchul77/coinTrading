@@ -13,7 +13,7 @@ from pybithumb import Bithumb
 from dotenv import load_dotenv
 
 # Local modules
-from .utils import setup_logger, send_discord_message
+from utils import setup_logger, send_discord_message
 
 from dataclasses import dataclass, field
 from typing import Optional, List
