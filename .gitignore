@@ -28,3 +28,6 @@ pyvenv.cfg
 # ▶️ Logs and temp files
 *.log
 *.tmp
+
+# Shell scripts
+*.sh

@@ -3,35 +3,25 @@ import json
 import time
 import pyupbit
 import logging
-import requests
+# import requests  # utils에서 사용하므로 여기선 제거 가능하지만 safe하게 둠
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict
 from dotenv import load_dotenv
+
+# Local modules
+from .utils import setup_logger, send_discord_message as send_discord_bg
+
 load_dotenv()
 
 
 KST = timezone(timedelta(hours=9))
 # ----------------------------------------------------------------------------
-# 로깅 설정
+# 로깅 설정 (utils 사용)
 # ----------------------------------------------------------------------------
-# 로거 설정
-log_path = Path("log")
-log_path.mkdir(parents=True, exist_ok=True)
-LOG_FILE_NAME = log_path / f"adjust_trading_{datetime.today().strftime('%Y%m%d')}.log"
-
-logger = logging.getLogger("TradingBotLogger")
-logger.setLevel(logging.INFO)
-# 콘솔 핸들러 추가 (디버깅 시 유용)
-# stream_handler = logging.StreamHandler()
-# logger.addHandler(stream_handler)
-# 파일 핸들러 추가
-file_handler = RotatingFileHandler(LOG_FILE_NAME, maxBytes=100*1024*1024, backupCount=5)
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
+logger = setup_logger("TradingBotLogger", "adjust_trading")
 
 # ----------------------------------------------------------------------------
 # 환경 설정
@@ -65,16 +55,8 @@ class OrderState:
 # 상태 파일 관리
 # ----------------------------------------------------------------------------
 def send_discord_message(text: str):
-    """디스코드 채널로 메시지 전송 (웹훅 JSON, 타임아웃/예외 처리 포함)"""
-    discord_url = os.getenv("DISCORD_DCT_URL")
-    if not discord_url:
-        logger.warning("DISCORD_URL이 설정되지 않았습니다.")
-        return
-    payload = {"content": f"[{datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')}] {text}"}
-    try:
-        requests.post(discord_url, json=payload, timeout=5)
-    except requests.RequestException as e:
-        logger.error(f"디스코드 메시지 전송 실패: {e}")
+    """utils.send_discord_message 래퍼 (DCT URL 사용)"""
+    send_discord_bg(text, env_var_name="DISCORD_DCT_URL")
 
 def load_state() -> OrderState:
     if os.path.isfile(STATE_FILE):

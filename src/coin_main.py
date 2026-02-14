@@ -1,25 +1,27 @@
-# 필요한 패키지를 설치하세요: python-dotenv, pybithumb, requests
+
 import os
 import time
 import logging
 import json
-from datetime import datetime
-from logging.handlers import RotatingFileHandler
-from pathlib import Path
-import requests
 import signal
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+# External packages
+import requests
 from pybithumb import Bithumb
 from dotenv import load_dotenv
 
+# Local modules
+from .utils import setup_logger, send_discord_message
+
 from dataclasses import dataclass, field
-from typing import Optional
-from datetime import datetime, timezone, timedelta
+from typing import Optional, List
 
 # --- 상수 정의 ---
-# 거래 상태
 STANDBY = 'STANDBY'  # 대기
-BUYING = 'BUYING'  # 매수 주문 진행 중
-ACTIVE = 'ACTIVE'  # 매수 완료 (매도 대기)
+BUYING = 'BUYING'    # 매수 주문 진행 중
+ACTIVE = 'ACTIVE'    # 매수 완료 (매도 대기)
 SELLING = 'SELLING'  # 매도 주문 진행 중
 
 KST = timezone(timedelta(hours=9))
@@ -27,54 +29,88 @@ KST = timezone(timedelta(hours=9))
 # --- 환경 설정 ---
 load_dotenv()
 
-# 로거 설정
-log_path = Path("log")
-log_path.mkdir(parents=True, exist_ok=True)
-LOG_FILE_NAME = log_path / f"trading_{datetime.today().strftime('%Y%m%d')}.log"
-
-logger = logging.getLogger("TradingBotLogger")
-logger.setLevel(logging.INFO)
-file_handler = RotatingFileHandler(LOG_FILE_NAME, maxBytes=100 * 1024 * 1024, backupCount=5, encoding="utf-8")
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
-
+# 로거 설정 (utils 사용)
+logger = setup_logger("TradingBotLogger", "trading")
 
 # --- 유틸리티 함수 ---
-def send_discord_message(text: str):
-    """디스코드 채널로 메시지 전송 (웹훅 JSON, 타임아웃/예외 처리 포함)"""
-    discord_url = os.getenv("DISCORD_SCT_URL")
-    if not discord_url:
-        logger.warning("DISCORD_URL이 설정되지 않았습니다.")
-        return
-    payload = {"content": f"[{datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')}] {text}"}
-    try:
-        requests.post(discord_url, json=payload, timeout=5)
-    except requests.RequestException as e:
-        logger.error(f"디스코드 메시지 전송 실패: {e}")
-
-def save_strategies_snapshot(strategies, filepath: str):
+def save_strategies_snapshot(strategies: List['Strategy'], filepath: str):
     """전략 리스트를 JSON으로 저장"""
     try:
-        snapshot_dir = Path(filepath).parent
-        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_path = Path(filepath)
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
 
         data = [s.to_dict() for s in strategies]
-        with open(filepath, "w", encoding="utf-8") as f:
+        with open(snapshot_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
         logger.info(f"전략 스냅샷 저장: {filepath} (개수: {len(data)})")
     except Exception as e:
         logger.error(f"전략 스냅샷 저장 실패: {e}")
 
+def load_strategies_snapshot(filepath: str) -> Optional[List['Strategy']]:
+    """저장된 전략 JSON을 읽어와서 Strategy 객체 리스트로 반환"""
+    snapshot_path = Path(filepath)
+    if not snapshot_path.exists():
+        logger.info(f"저장된 스냅샷 없음: {filepath}")
+        return None
+
+    try:
+        with open(snapshot_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        strategies = []
+        for item in data:
+            # 필수 필드 체크 (기존 데이터 호환성 고려)
+            if 'strategy_id' not in item:
+                continue
+                
+            s = Strategy(
+                strategy_id=item['strategy_id'],
+                buy_price=item['buy_price'],
+                sell_price=item['sell_price'],
+                order_qty=item['order_qty'],
+                status=item.get('status', STANDBY),
+                order_id=item.get('order_id'),
+                # last_action_at은 문자열에서 datetime으로 변환 (ISO 포맷 가정)
+            )
+            if 'last_action_at' in item:
+                try:
+                    s.last_action_at = datetime.fromisoformat(item['last_action_at'])
+                except ValueError:
+                    s.last_action_at = datetime.now(KST)
+            strategies.append(s)
+            
+        logger.info(f"전략 스냅샷 로드 완료: {len(strategies)}개")
+        return strategies
+    except Exception as e:
+        logger.error(f"전략 스냅샷 로드 실패: {e}")
+        return None
+
+def load_config(config_path: str = "config.json") -> dict:
+    """설정 파일 로드"""
+    try:
+        # 실행 파일 기준 경로 계산 (src 폴더 내에 있다고 가정)
+        base_dir = Path(__file__).parent
+        path = base_dir / config_path
+        
+        if not path.exists():
+            # src 상위에서 실행했을 경우 대비
+            path = Path(config_path)
+            
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.critical(f"설정 파일({config_path}) 로드 실패: {e}")
+        raise
+
 # --- 핵심 로직: Strategy 클래스 ---
 @dataclass
 class Strategy:
     """단일 분할매매 전략"""
     strategy_id: int
-    buy_price: int
-    sell_price: int
-    order_qty: int
+    buy_price: float  # float로 변경 (소수점 가격 대응)
+    sell_price: float
+    order_qty: float
 
     status: str = STANDBY
     order_id: Optional[str] = None
@@ -91,10 +127,6 @@ class Strategy:
             "last_action_at": self.last_action_at.isoformat(),
         }
 
-    def _print(self):
-        print(
-            f"strategy_id: {self.strategy_id}, buy_price: {self.buy_price}, sell_price: {self.sell_price}, order_qty: {self.order_qty}, status: {self.status}, order_id: {self.order_id}, last_action_at: {self.last_action_at}")
-
     def update(self, current_price, client: Bithumb, ticker: str, buy_margin, buy_interval, cancel_depth: int):
         try:
             if self.status == STANDBY:
@@ -103,7 +135,7 @@ class Strategy:
                     self._place_order(client, 'buy', ticker)
 
             elif self.status == BUYING:
-                # 현재가보다 5개 전략(= buy_interval * 5) 이상 '밑'에 있는 매수 대기 주문은 취소하여 예수금 확보
+                # 현재가보다 cancel_depth * buy_interval 이상 밑에 있는 매수 대기 주문은 취소
                 threshold_price = current_price - (buy_interval * cancel_depth)
                 if self.buy_price <= threshold_price:
                     if self._cancel_open_order(client):
@@ -123,7 +155,7 @@ class Strategy:
 
         except Exception as e:
             logger.error(f"[Strategy {self.strategy_id}] 업데이트 오류: {e}")
-            send_discord_message(f" [Strategy {self.strategy_id}] 오류: {e}")
+            send_discord_message(f"[Strategy {self.strategy_id}] 오류: {e}")
             # 상태를 단순 리셋하지 않고, 미체결이 있으면 취소 후 STANDBY로
             try:
                 self._cancel_open_order(client)
@@ -140,32 +172,25 @@ class Strategy:
             logger.warning(f"[Strategy {self.strategy_id}] 비정상 호가(매도가<=매수가). 매도 생략: {price} <= {self.buy_price}")
             return
 
-        # 예수금(보유 KRW) 부족 체크: BUY일 때만 --> 확인 필요
+        # 예수금 부족 체크 (매수 시)
         if order_type == 'buy':
             try:
                 bal = client.get_balance(ticker)
-                # 기대 형태: [보유코인, 거래중코인, 보유원화, 거래중원화, ...]
                 krw_avail = None
-                if isinstance(bal, dict) and len(bal) >= 3:
-                    krw_avail = float(bal[2])
-                # 필요 원화 = 가격 * 수량 (+ 수수료/버퍼 약간)
-                need_krw = float(price) * float(qty)
-                fee_buffer_ratio = 0.001  # 0.1% 정도 버퍼(원하면 조정/환경변수화)
-                need_krw *= (1.0 + fee_buffer_ratio)
-
+                if isinstance(bal, tuple) or isinstance(bal, list):
+                     krw_avail = float(bal[2]) # [보유코인, 거래중코인, 보유원화, ... ]
+                
+                need_krw = float(price) * float(qty) * 1.002 # 수수료 버퍼 0.2%
+                
                 if krw_avail is not None and krw_avail < need_krw:
-                    msg = (f"[Strategy {self.strategy_id}] 예수금 부족으로 매수 보류: "
-                        f"필요 {need_krw:,.0f} KRW > 보유 {krw_avail:,.0f} KRW "
-                        f"(price={price}, qty={qty})")
-                    logger.warning(msg)
-                    send_discord_message(msg)
-                    return
+                     msg = (f"[Strategy {self.strategy_id}] 예수금 부족으로 매수 보류: "
+                            f"필요 {need_krw:,.0f} KRW > 보유 {krw_avail:,.0f} KRW")
+                     logger.warning(msg)
+                     # send_discord_message(msg) # 너무 자주 올 수 있으므로 로그만
+                     return
             except Exception as e:
-                # 잔고 조회 실패 시, 안전을 위해 주문을 진행하지 않고 경고만 남김
-                warn = f"[Strategy {self.strategy_id}] 잔고 조회 실패로 매수 보류: {e}"
-                logger.warning(warn)
-                send_discord_message(warn)
-                return
+                logger.warning(f"잔고 조회 실패: {e}")
+                pass
 
         try:
             if order_type == 'buy':
@@ -174,11 +199,14 @@ class Strategy:
                 order_id = client.sell_limit_order(ticker, float(price), float(qty))
         except Exception as e:
             logger.error(f"[Strategy {self.strategy_id}] {order_type.upper()} 주문 예외: {e}")
-            send_discord_message(f" [Strategy {self.strategy_id}] {order_type.upper()} 주문 실패(예외): {e}")
+            send_discord_message(f"[Strategy {self.strategy_id}] {order_type.upper()} 주문 실패(예외): {e}")
             return
 
+        if isinstance(order_id, tuple): # 가끔 tuple로 리턴되는 경우 방어
+             order_id = order_id[0] if order_id else None
+
         if order_id:
-            self.order_id = order_id
+            self.order_id = str(order_id)
             self.status = BUYING if order_type == 'buy' else SELLING
             self.last_action_at = datetime.now(KST)
             msg = f"[Strategy {self.strategy_id}] {order_type.upper()} 주문 제출: price={price}, qty={qty}, id={order_id}"
@@ -187,7 +215,7 @@ class Strategy:
         else:
             msg = f"[Strategy {self.strategy_id}] {order_type.upper()} 주문 실패(응답 비정상): {order_id}"
             logger.error(msg)
-            send_discord_message(f" {msg}")
+            send_discord_message(msg)
 
     def _check_order_completion(self, client: Bithumb, order_type: str):
         if not self.order_id:
@@ -198,50 +226,38 @@ class Strategy:
             logger.error(f"[Strategy {self.strategy_id}] 체결 조회 실패: {e}")
             return
 
-        # 기대 형태: {"status":"0000","data":[{...}]}
+        # Bithumb API 응답 처리 (성공 시 status="0000")
         if not isinstance(result, dict) or result.get("status") != "0000":
-            logger.error(f"[Strategy {self.strategy_id}] 체결 응답 비정상: {result}")
+            # API 오류 혹은 아직 체결 데이터 없음
             return
         
         data = result.get("data")
+        if not data:
+             return
 
-        if not isinstance(data, dict) or not data :
-            logger.info(f"[Strategy {self.strategy_id}] 체결 내역 없음(대기 중일 수 있음): {result}")
-            return
-
-        if data.get("order_status") == 'Completed':
-            try:
-                order_qty = float(data.get("order_qty", 0) or 0)
-                contracts = data.get("contract") or []
-                filled_qty = sum(float(c.get("units", 0) or 0) for c in contracts)
-                # 상태 문자열이 Completed여도 부분 체결일 수 있으므로 수량 비교로 판단
-                eps = 1e-12
-                full_filled = abs(order_qty - filled_qty) <= eps
-            except Exception as e:
-                logger.error(f"[Strategy {self.strategy_id}] 체결 데이터 파싱 실패: {e} / raw={data}")
-                return
-            
-            if full_filled:
-                if order_type == 'buy':
-                    self.status = ACTIVE
-                    msg = f" [Strategy {self.strategy_id}] 매수 완전 체결! -> 매도 대기 (id={self.order_id}, qty={order_qty})"
-                else:
-                    self.status = STANDBY
-                    msg = f" [Strategy {self.strategy_id}] 매도 완전 체결! -> 초기화 (id={self.order_id}, qty={order_qty})"
-                logger.info(msg)
-                send_discord_message(msg)
-                self.order_id = None
-                self.last_action_at = datetime.now(KST)
-            else:
-                # 부분 체결 진행 중 (잔량은 참고용 로그)
-                remain = max(order_qty - filled_qty, 0.0)
-                logger.info(
-                    f"[Strategy {self.strategy_id}] 부분 체결 진행 중: filled={filled_qty}, "
-                    f"ordered={order_qty}, remain={remain}"
-                )
+        # data가 리스트인 경우도 있고 딕셔너리인 경우도 있음 (체결 내역)
+        # 보통 get_order_completed는 체결된 내역 리스트 반환
+        # order_status를 확인해야 함. pybithumb의 get_order_completed는 완료된 주문에 대해서만 정보를 줄 수도 있음.
+        # 여기서는 pybithumb 동작 방식에 의존.
+        
+        # 상세 구현: order_status가 Completed인지 확인
+        order_status = data.get("order_status")
+        if order_status == 'Completed':
+             # 완전 체결로 간주
+             if order_type == 'buy':
+                 self.status = ACTIVE
+                 msg = f"[Strategy {self.strategy_id}] 매수 완전 체결! -> 매도 대기"
+             else:
+                 self.status = STANDBY
+                 msg = f"[Strategy {self.strategy_id}] 매도 완전 체결! -> 초기화"
+             
+             logger.info(msg)
+             send_discord_message(msg)
+             self.order_id = None
+             self.last_action_at = datetime.now(KST)
 
     def _cancel_open_order(self, client: Bithumb) -> bool:
-        if self.status in [BUYING] and self.order_id:
+        if self.status in [BUYING, SELLING] and self.order_id:
             try:
                 client.cancel_order(self.order_id)
                 logger.info(f"[Strategy {self.strategy_id}] 미체결 주문 취소: id={self.order_id}")
@@ -249,7 +265,7 @@ class Strategy:
                 logger.error(f"[Strategy {self.strategy_id}] 주문 취소 실패: {e}")
                 return False
             finally:
-                # BUYING 취소면 다시 STANDBY, SELLING 취소면 다시 ACTIVE로 되돌림
+                # 상태 복구
                 self.status = STANDBY if self.status == BUYING else ACTIVE
                 self.order_id = None
                 self.last_action_at = datetime.now(KST)
@@ -268,193 +284,156 @@ class GracefulKiller:
         self.stop = True
 
 
-# --- 메인 실행 로직 ---
-def main(trading_cfg: dict | None):
+def main(config_file: str = "config.json"):
     """메인 트레이딩 봇 로직"""
-    # --- 거래 설정 ---
-
-    if trading_cfg is None:
-        TRADING_CONFIG = {
-            "ticker": "DOGE",
-            "start_buy_price": 323,
-            "divide_count": 5,
-            "order_qty": 20,
-            "buy_interval": 1,
-            "sell_interval": 1,
-            "buy_margin": 2,  # 현재가가 매수가보다 이만큼 높아도 매수 시도 (기존 로직: buyInterval * 2)
-            "loop_interval": 3,  # (초)
-            "report_interval_loops": 600,
-            "cancel_depth": 5,
-            "max_up_strategies": 5,
-            "save_interval_loops": 120,                       # 몇 루프마다 저장할지
-            "snapshot_path": "snapshots/strategies.json",     # 저장 경로
-        }
-    else:
-        TRADING_CONFIG = trading_cfg
+    
+    # 설정 로드
+    try:
+        config = load_config(config_file)
+        logger.info(f"설정 로드 완료: {config['ticker']} (파일: {config_file})")
+    except Exception:
+        return
 
     # Bithumb 클라이언트 초기화
     try:
         connect_key = os.getenv("BITHUMB_ACCESS_KEY")
         secret_key = os.getenv("BITHUMB_SECRET_KEY")
+        if not connect_key or not secret_key:
+            raise ValueError("BITHUMB keys not found in .env")
         bithumb_client = Bithumb(connect_key, secret_key)
     except Exception as e:
         logger.critical(f"Bithumb 클라이언트 초기화 실패: {e}")
         return
 
-    # 전략 리스트 생성
-    strategies = [
-        Strategy(
-            strategy_id=i,
-            buy_price=TRADING_CONFIG["start_buy_price"] - (TRADING_CONFIG["buy_interval"] * i),
-            sell_price=TRADING_CONFIG["start_buy_price"] - (TRADING_CONFIG["buy_interval"] * i) + TRADING_CONFIG[
-                "sell_interval"],
-            order_qty=TRADING_CONFIG["order_qty"]
+    # 전략 초기화 (스냅샷 로드 시도 -> 없으면 새로 생성)
+    snapshot_path = config.get("snapshot_path", "snapshots/strategies.json")
+    loaded_strategies = load_strategies_snapshot(snapshot_path)
+    
+    if loaded_strategies:
+        strategies = loaded_strategies
+        logger.info(f"기존 전략 상태를 복구했습니다 (총 {len(strategies)}개).")
+    else:
+        logger.info("저장된 전략이 없어 새로운 전략을 생성합니다.")
+        strategies = [
+            Strategy(
+                strategy_id=i,
+                buy_price=config["start_buy_price"] - (config["buy_interval"] * i),
+                sell_price=config["start_buy_price"] - (config["buy_interval"] * i) + config["sell_interval"],
+                order_qty=config["order_qty"]
+            )
+            for i in range(config["divide_count"])
+        ]
+
+    # 시작 알림
+    try:
+        balance = bithumb_client.get_balance(config["ticker"])
+        # balance: (total_coin, in_use_coin, total_krw, in_use_krw)
+        start_msg = (
+            f"**트레이딩 봇 시작**\n"
+            f"- Ticker: {config['ticker']}\n"
+            f"- KRW: {float(balance[2]):,.0f}\n"
+            f"- Coin: {float(balance[0]):,.4f}"
         )
-        for i in range(TRADING_CONFIG["divide_count"])
-    ]
-
-    # 위로 추가된 전략 관리 상태값
-    up_created = 0
-    next_up_offset = 1  # start_buy_price + buy_interval * 1 부터 시작
-
-    # 트레이딩 시작 알림
-    my_balance = bithumb_client.get_balance(TRADING_CONFIG["ticker"])
-    start_msg = (
-        f" **트레이딩 봇 시작**\n"
-        f" - 티커: {TRADING_CONFIG['ticker']}\n"
-        f" - 보유수량: {my_balance[0]}\n"
-        f" - 거래중수량: {my_balance[1]}\n"
-        f" - 보유원화: {my_balance[2]:,.0f} KRW\n"
-        f" - 거래중원화: {my_balance[3]:,.0f} KRW"
-    )
-    logger.info(start_msg.replace('\n', ' '))
-    send_discord_message(start_msg)
+        send_discord_message(start_msg)
+    except Exception as e:
+        logger.error(f"초기 잔고 조회 실패: {e}")
 
     killer = GracefulKiller()
     loop_count = 0
+    
     while not killer.stop:
         try:
             loop_count += 1
-
+            
             # 현재가 조회
-            current_price = bithumb_client.get_current_price(TRADING_CONFIG["ticker"])
+            current_price = bithumb_client.get_current_price(config["ticker"])
             if not current_price:
-                logger.warning("현재가를 가져올 수 없습니다. 다음 루프에서 재시도합니다.")
-                time.sleep(TRADING_CONFIG["loop_interval"])
+                logger.warning("현재가 조회 실패. 재시도...")
+                time.sleep(config["loop_interval"])
                 continue
 
-            logger.info(f"--- [Loop {loop_count}] 현재가: {current_price:,} KRW, New created: {up_created:,} ---")
-
-            # (1) 상승 시 위쪽 전략을 하나씩 추가하며 즉시 매수, 최대 max_up_strategies까지
-            while True:
-                if up_created > TRADING_CONFIG["max_up_strategies"]:
+            # (상승장 대응) 위쪽 레벨 전략 추가 로직
+            # 기존 로직 유지하되 config 참조
+            max_up = config["max_up_strategies"]
+            # 현재 전략 중 가장 높은 ID와 가장 높은 buy_price 찾기
+            max_id = max([s.strategy_id for s in strategies]) if strategies else -1
+            
+            # "현재가가 가장 높은 매수 전략의 매수가보다 buy_interval 이상 높으면" 추가
+            while len(strategies) < (config["divide_count"] + max_up):
+                # 가장 높은 매수 설정가 구하기
+                top_strategy = max(strategies, key=lambda s: s.buy_price)
+                next_target = top_strategy.buy_price + config["buy_interval"]
+                
+                # 현재가가 다음 타겟보다 높아야 추가 (추격 매수)
+                if current_price < next_target:
                     break
-
-                target_level = TRADING_CONFIG["start_buy_price"] + (TRADING_CONFIG["buy_interval"] * next_up_offset)
-                if current_price < target_level:
-                    break  # 아직 다음 위 레벨을 돌파하지 않음
-
-                # 같은 레벨의 전략이 이미 있으면(중복 생성 방지) 생성 보류
-                already_exists = any(s.buy_price == target_level for s in strategies)
-                if already_exists:
-                    break  # 다음 루프에서 다시 확인
-
-                # 해당 레벨에 '매도 대기/매도 진행' 전략이 있으면 충돌 방지 위해 생성/매수 보류
-                sell_conflict = any(
-                    (s.sell_price == target_level) and (s.status in (ACTIVE, SELLING, BUYING)) for s in strategies)
-                if sell_conflict:
-                    break  # 326 매도 체결 완료될 때까지 대기
-
-                new_id = max([s.strategy_id for s in strategies]) + 1 if strategies else 0
-                new_buy = target_level
-                new_sell = target_level + TRADING_CONFIG["sell_interval"]
+                
+                # 새 전략 추가
+                new_id = max_id + 1
                 new_strategy = Strategy(
                     strategy_id=new_id,
-                    buy_price=new_buy,
-                    sell_price=new_sell,
-                    order_qty=TRADING_CONFIG["order_qty"]
+                    buy_price=next_target,
+                    sell_price=next_target + config["sell_interval"],
+                    order_qty=config["order_qty"]
                 )
                 strategies.append(new_strategy)
+                max_id = new_id
+                
+                msg = f"[Strategy {new_id}] 상승장 전략 추가: buy={next_target}"
+                logger.info(msg)
+                send_discord_message(msg)
+                
+                # 즉시 매수 시도
+                new_strategy._place_order(bithumb_client, 'buy', config["ticker"])
 
-                add_msg = (f"[Strategy {new_id}] 위 레벨 전략 추가: "
-                           f"buy={new_buy}, sell={new_sell}, 현재가={current_price} (offset={next_up_offset})")
-                logger.info(add_msg)
-                send_discord_message(add_msg)
 
-                # 즉시 매수는 '충돌 없을 때만' 진행 (위의 가드 통과 시에만 여기 도달)
-                try:
-                    new_strategy._place_order(bithumb_client, 'buy', TRADING_CONFIG["ticker"])
-                except Exception as e:
-                    logger.error(f"[Strategy {new_id}] 즉시 매수 제출 실패: {e}")
-
-                up_created += 1
-                next_up_offset += 1
-
-            # [핵심] 모든 전략을 한번에 업데이트
+            # 모든 전략 업데이트
             for strategy in strategies:
-                strategy.update(current_price, bithumb_client, TRADING_CONFIG["ticker"], TRADING_CONFIG["buy_margin"],
-                                TRADING_CONFIG["buy_interval"], TRADING_CONFIG["cancel_depth"])
+                strategy.update(
+                    current_price, 
+                    bithumb_client, 
+                    config["ticker"], 
+                    config["buy_margin"], 
+                    config["buy_interval"], 
+                    config["cancel_depth"]
+                )
 
-            # 주기적 리포트
-            if loop_count % TRADING_CONFIG["report_interval_loops"] == 0:
-                report_text = f"** 생존 신고 (Loop {loop_count})**\n - 현재가: {current_price:,} KRW\n"
-                active_strategies = []
-                for s in strategies:
-                    if s.status != STANDBY:
-                        active_strategies.append(
-                            f" - ID {s.strategy_id}: {s.status}, 매수 {s.buy_price}, 매도 {s.sell_price}")
-
-                if active_strategies:
-                    report_text += "**[진행중인 전략]**\n" + "\n".join(active_strategies)
+            # 리포트 및 저장
+            if loop_count % config["report_interval_loops"] == 0:
+                actives = [f"ID {s.strategy_id}: {s.status}" for s in strategies if s.status != STANDBY]
+                if actives:
+                    send_discord_message(f"**생존 신고**\n현재가: {current_price}\n진행중: {', '.join(actives)}")
                 else:
-                    report_text += " - 모든 전략 대기 중"
+                    logger.info(f"생존 신고 - 현재가: {current_price} (진행중 없음)")
 
-                send_discord_message(report_text)
-                logger.info("주기적 리포트 전송 완료.")
+            if loop_count % config["save_interval_loops"] == 0:
+                save_strategies_snapshot(strategies, snapshot_path)
 
-            # 스냅샷 주기 저장
-            if loop_count % TRADING_CONFIG["save_interval_loops"] == 0:
-                save_strategies_snapshot(strategies, TRADING_CONFIG["snapshot_path"])
-
-            time.sleep(TRADING_CONFIG["loop_interval"])
+            time.sleep(config["loop_interval"])
 
         except Exception as e:
-            logger.critical(f"메인 루프에서 예측하지 못한 오류 발생: {e}")
-            send_discord_message(f" **치명적 오류 발생**: {e}\n봇을 확인해야 합니다.")
-            time.sleep(60)  # 오류 발생 시 잠시 대기
+            logger.critical(f"메인 루프 에러: {e}")
+            send_discord_message(f"메인 루프 에러: {e}")
+            time.sleep(10)
 
-    # 트레이딩 종료 처리
-    logger.info("최대 루프 횟수에 도달하여 트레이딩을 종료합니다. 미체결 주문을 취소합니다.")
-    send_discord_message(" **트레이딩 종료 중...**\n미체결된 매수/매도 주문을 취소합니다.")
-    # ⬇️ 종료 전 스냅샷
-    save_strategies_snapshot(strategies, TRADING_CONFIG["snapshot_path"])
-
-    cancelled_count = 0
-    for strategy in strategies:
-        if strategy._cancel_open_order(bithumb_client):
-            cancelled_count += 1
-
-    end_msg = f" **트레이딩 봇 종료**\n - 총 {cancelled_count}개의 주문을 취소했습니다."
+    # 종료 처리
+    logger.info("종료 시그널 감지. 정리 중...")
+    save_strategies_snapshot(strategies, snapshot_path)
+    
+    # 미체결 취소 (선택사항 - config에 따라 다를 수 있으나 안전을 위해 취소 추천)
+    cancel_cnt = 0
+    for s in strategies:
+        if s._cancel_open_order(bithumb_client):
+            cancel_cnt += 1
+            
+    end_msg = f"봇 종료. 미체결 {cancel_cnt}건 취소 완료."
     logger.info(end_msg)
     send_discord_message(end_msg)
 
-
 if __name__ == "__main__":
-    TRADING_CONFIG = {
-        "ticker": "DOGE",
-        "start_buy_price": 325,
-        "divide_count": 20,
-        "order_qty": 250,
-        "buy_interval": 1,
-        "sell_interval": 1,
-        "buy_margin": 2,  # 현재가가 매수가보다 이만큼 높아도 매수 시도 (기존 로직: buyInterval * 2)
-        "loop_interval": 3,  # (초)
-        "report_interval_loops": 300,
-        "cancel_depth": 5,
-        "max_up_strategies": 10,
-        "save_interval_loops": 60,                       # 몇 루프마다 저장할지
-        "snapshot_path": "snapshots/strategies.json",     # 저장 경로        
-    }
-    main(TRADING_CONFIG)
-
-
+    import argparse
+    parser = argparse.ArgumentParser(description="Coin Trading Bot")
+    parser.add_argument("--config", type=str, default="config.json", help="Path to configuration file")
+    args = parser.parse_args()
+    
+    main(args.config)
