@@ -5,3 +5,5 @@ pyJwt
 dotenv
 pathlib
 logging
+pydantic
+pydantic_settings
