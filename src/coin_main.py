@@ -27,7 +27,8 @@ SELLING = 'SELLING'  # 매도 주문 진행 중
 KST = timezone(timedelta(hours=9))
 
 # --- 환경 설정 ---
-load_dotenv()
+env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=env_path)
 
 # 로거 설정 (utils 사용)
 logger = setup_logger("TradingBotLogger", "trading")

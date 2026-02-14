@@ -14,7 +14,9 @@ from dotenv import load_dotenv
 # Local modules
 from .utils import setup_logger, send_discord_message as send_discord_bg
 
-load_dotenv()
+# .env 로드
+env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=env_path)
 
 
 KST = timezone(timedelta(hours=9))
